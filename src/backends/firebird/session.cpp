@@ -453,27 +453,37 @@ void firebird_session_backend::free_event_buffers()
 
 void firebird_session_backend::stop_event_listener()
 {
+	// Must not hold event_listener_mutex_ across isc_cancel_events(): fbclient's event thread
+	// holds its internal callback mutex while calling event_handler (which takes our mutex),
+	// and isc_cancel_events waits for that same callback mutex -> ABBA deadlock.
+	// While the cancel is pending, event_handler bails out without re-queueing. The handle and
+	// buffers are kept until the cancel succeeds, so start_event_listener() refuses to restart
+	// and a late callback from a request that failed to cancel still sees its own buffers.
 	ISC_LONG handle;
 	{
 		std::lock_guard lock(event_listener_mutex_);
+		if (!event_listen_handle_ || event_cancel_pending_)
+			return;
 		handle = event_listen_handle_;
-		event_listen_handle_ = 0;
+		event_cancel_pending_ = true;
 	}
 
-	if (handle)
+	ISC_STATUS stat[stat_size];
+	const bool failed = isc_cancel_events(stat, &dbhp_, &handle);
+
 	{
-		ISC_STATUS stat[stat_size];
-		const bool failed = isc_cancel_events(stat, &dbhp_, &handle);
-
+		std::lock_guard lock(event_listener_mutex_);
+		event_cancel_pending_ = false;
+		if (!failed)
 		{
-			std::lock_guard lock(event_listener_mutex_);
 			free_event_buffers();
+			event_listen_handle_ = 0;
 		}
+	}
 
-		if (failed)
-		{
-			throw_iscerror(stat);
-		}
+	if (failed)
+	{
+		throw_iscerror(stat);
 	}
 }
 
@@ -539,7 +549,7 @@ void firebird_session_backend::event_handler(void* object, ISC_USHORT size, cons
 	firebird_session_backend* backend = (firebird_session_backend*)object;
 
 	std::lock_guard lock(backend->event_listener_mutex_);
-	if (backend->event_listen_handle_)
+	if (backend->event_listen_handle_ && !backend->event_cancel_pending_)
 	{
 		std::memcpy(backend->event_results_.data(), tmpbuffer, size);
 
