@@ -453,17 +453,27 @@ void firebird_session_backend::free_event_buffers()
 
 void firebird_session_backend::stop_event_listener()
 {
-	std::unique_lock lock(event_listener_mutex_);
-	if (event_listen_handle_)
+	ISC_LONG handle;
 	{
- 		ISC_STATUS stat[stat_size];
-		if (isc_cancel_events(stat, &dbhp_, &event_listen_handle_))
+		std::lock_guard lock(event_listener_mutex_);
+		handle = event_listen_handle_;
+		event_listen_handle_ = 0;
+	}
+
+	if (handle)
+	{
+		ISC_STATUS stat[stat_size];
+		const bool failed = isc_cancel_events(stat, &dbhp_, &handle);
+
+		{
+			std::lock_guard lock(event_listener_mutex_);
+			free_event_buffers();
+		}
+
+		if (failed)
 		{
 			throw_iscerror(stat);
 		}
-		free_event_buffers();
-		event_listen_handle_ = 0;
-		lock.unlock();
 	}
 }
 
