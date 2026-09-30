@@ -360,6 +360,8 @@ private:
 	std::atomic<bool> has_events_ = false;
 	std::mutex event_listener_mutex_;
 	ISC_LONG event_listen_handle_ = 0;
+	bool event_cancel_pending_ = false; // guarded by event_listener_mutex_
+	bool event_fired_during_cancel_ = false; // guarded by event_listener_mutex_
 	std::vector<uint8_t> event_buffer_;
 	std::vector<uint8_t> event_results_;
 	std::map<std::string, size_t> triggered_events_;
