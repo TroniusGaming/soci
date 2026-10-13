@@ -462,7 +462,8 @@ void firebird_session_backend::stop_event_listener()
 	ISC_LONG handle;
 	{
 		std::lock_guard lock(event_listener_mutex_);
-		if (!event_listen_handle_)
+		// another caller is already cancelling this request: a second cancel would race it on the shared flags and buffers
+		if (!event_listen_handle_ || event_cancel_pending_)
 			return;
 
 		handle = event_listen_handle_;
