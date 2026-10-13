@@ -459,18 +459,32 @@ void firebird_session_backend::free_event_buffers()
 
 void firebird_session_backend::stop_event_listener()
 {
-	std::unique_lock lock(event_listener_mutex_);
-	if (event_listen_handle_)
+	ISC_LONG handle;
 	{
- 		ISC_STATUS stat[stat_size];
-		if (isc_cancel_events(stat, &dbhp_, &event_listen_handle_))
-		{
-			throw_iscerror(stat);
-		}
-		free_event_buffers();
-		event_listen_handle_ = 0;
-		lock.unlock();
+		std::lock_guard lock(event_listener_mutex_);
+		if (!event_listen_handle_)
+			return;
+
+		handle = event_listen_handle_;
+		event_cancel_pending_ = true;
+		event_fired_during_cancel_ = false;
 	}
+
+	// Cancel without holding event_listener_mutex_: fbclient may be inside event_handler() for this request,
+	// holding its own callback mutex while waiting for ours, and isc_cancel_events() waits for that callback.
+	ISC_STATUS stat[stat_size];
+	const bool cancel_failed = isc_cancel_events(stat, &dbhp_, &handle) != 0;
+
+	std::lock_guard lock(event_listener_mutex_);
+	event_cancel_pending_ = false;
+
+	// A callback that ran meanwhile consumed the request without re-queueing, so a failed cancel is expected then.
+	// Otherwise the request may still be queued: keep the handle and buffers it delivers into.
+	if (cancel_failed && !event_fired_during_cancel_)
+		throw_iscerror(stat);
+
+	free_event_buffers();
+	event_listen_handle_ = 0;
 }
 
 class event_iterator
@@ -553,13 +567,18 @@ void firebird_session_backend::event_handler(void* object, ISC_USHORT size, cons
 			}
 		}
 
-		try
+		if (backend->event_cancel_pending_)
+			backend->event_fired_during_cancel_ = true; // request consumed; stop_event_listener() treats it as stopped
+		else
 		{
-			backend->listen();
-		}
-		catch (soci_error const &)
-		{
-			// must not unwind into fbclient's thread; listen() has already dropped the handle and buffers
+			try
+			{
+				backend->listen();
+			}
+			catch (soci_error const &)
+			{
+				// must not unwind into fbclient's thread; listen() has already dropped the handle and buffers
+			}
 		}
 	}
 }
