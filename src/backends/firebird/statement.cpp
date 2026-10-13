@@ -55,10 +55,8 @@ void firebird_statement_backend::clean_up()
 
     if (stmtp_ != 0)
     {
-        if (isc_dsql_free_statement(stat, &stmtp_, DSQL_drop))
-        {
-            throw_iscerror(stat);
-        }
+        // reached from the destructor too: a failed free must not throw
+        isc_dsql_free_statement(stat, &stmtp_, DSQL_drop);
         stmtp_ = 0;
     }
 

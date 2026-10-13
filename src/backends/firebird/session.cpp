@@ -396,28 +396,34 @@ isc_tr_handle* firebird_session_backend::current_transaction()
 
 void firebird_session_backend::cleanUp()
 {
+    // runs from the destructor, so nothing here may throw; after a lost connection every call below fails anyway
     ISC_STATUS stat[stat_size];
 
-    // at the end of session our transaction is finally commited.
     if (trhp_ != 0)
     {
         if (isc_commit_transaction(stat, &trhp_))
         {
-            throw_iscerror(stat);
+            isc_rollback_transaction(stat, &trhp_);
         }
 
         trhp_ = 0;
-		trflags_ = details::trf_none;
+        trflags_ = details::trf_none;
     }
 
-	stop_event_listener();
-
-    if (isc_detach_database(stat, &dbhp_))
+    try
     {
-        throw_iscerror(stat);
+        stop_event_listener();
+    }
+    catch (soci_error const &)
+    {
+        // the cancel failed with no callback: the request dies with the attachment below
     }
 
-    dbhp_ = 0L;
+    if (dbhp_ != 0)
+    {
+        isc_detach_database(stat, &dbhp_);
+        dbhp_ = 0L;
+    }
 }
 
 bool firebird_session_backend::get_next_sequence_value(
@@ -453,43 +459,17 @@ void firebird_session_backend::free_event_buffers()
 
 void firebird_session_backend::stop_event_listener()
 {
-	// Must not hold event_listener_mutex_ across isc_cancel_events(): fbclient's event thread
-	// holds its internal callback mutex while calling event_handler (which takes our mutex),
-	// and isc_cancel_events waits for that same callback mutex -> ABBA deadlock.
-	// While the cancel is pending, event_handler still records the counts but does not re-queue.
-	// Firebird event requests are one-shot, so a callback during the cancel means the request is
-	// gone and the listener is stopped whatever isc_cancel_events() returns. Otherwise the handle
-	// and buffers are kept until the cancel succeeds, so on failure start_event_listener() refuses
-	// to restart and a late callback from the still-active request sees its own buffers.
-	ISC_LONG handle;
+	std::unique_lock lock(event_listener_mutex_);
+	if (event_listen_handle_)
 	{
-		std::lock_guard lock(event_listener_mutex_);
-		if (!event_listen_handle_ || event_cancel_pending_)
-			return;
-		handle = event_listen_handle_;
-		event_cancel_pending_ = true;
-		event_fired_during_cancel_ = false;
-	}
-
-	ISC_STATUS stat[stat_size];
-	const bool failed = isc_cancel_events(stat, &dbhp_, &handle);
-
-	bool request_active;
-	{
-		std::lock_guard lock(event_listener_mutex_);
-		request_active = failed && !event_fired_during_cancel_;
-		event_cancel_pending_ = false;
-		event_fired_during_cancel_ = false;
-		if (!request_active)
+ 		ISC_STATUS stat[stat_size];
+		if (isc_cancel_events(stat, &dbhp_, &event_listen_handle_))
 		{
-			free_event_buffers();
-			event_listen_handle_ = 0;
+			throw_iscerror(stat);
 		}
-	}
-
-	if (request_active)
-	{
-		throw_iscerror(stat);
+		free_event_buffers();
+		event_listen_handle_ = 0;
+		lock.unlock();
 	}
 }
 
@@ -573,10 +553,14 @@ void firebird_session_backend::event_handler(void* object, ISC_USHORT size, cons
 			}
 		}
 
-		if (backend->event_cancel_pending_)
-			backend->event_fired_during_cancel_ = true; // request consumed; stop_event_listener() treats it as stopped
-		else
+		try
+		{
 			backend->listen();
+		}
+		catch (soci_error const &)
+		{
+			// must not unwind into fbclient's thread; listen() has already dropped the handle and buffers
+		}
 	}
 }
 

@@ -161,12 +161,9 @@ void firebird_blob_backend::cleanUp()
 
     if (bhp_ != 0)
     {
-        // close blob
+        // close blob; reached from the destructor too, a failed close must not throw
         ISC_STATUS stat[20];
-        if (isc_close_blob(stat, &bhp_))
-        {
-            throw_iscerror(stat);
-        }
+        isc_close_blob(stat, &bhp_);
         bhp_ = 0;
     }
 }
