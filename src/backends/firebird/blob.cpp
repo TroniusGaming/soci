@@ -42,9 +42,9 @@ firebird_blob_backend::~firebird_blob_backend()
     {
         cleanUp();
     }
-    catch (soci_error const &)
+    catch (...)
     {
-        // a destructor must not throw; close_blob() has already dropped the handle
+        // a destructor must not throw (building the error can throw bad_alloc too); close_blob() has already dropped the handle
     }
 }
 

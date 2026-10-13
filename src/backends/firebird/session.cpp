@@ -414,9 +414,9 @@ void firebird_session_backend::cleanUp()
     {
         stop_event_listener();
     }
-    catch (soci_error const &)
+    catch (...)
     {
-        // the cancel failed with no callback: the request dies with the attachment below
+        // the cancel failed with no callback, or locking/allocating threw: the request dies with the attachment below
     }
 
     if (dbhp_ != 0)
@@ -575,9 +575,9 @@ void firebird_session_backend::event_handler(void* object, ISC_USHORT size, cons
 			{
 				backend->listen();
 			}
-			catch (soci_error const &)
+			catch (...)
 			{
-				// must not unwind into fbclient's thread; listen() has already dropped the handle and buffers
+				// nothing may unwind into fbclient's thread; listen() has already dropped the handle and buffers
 			}
 		}
 	}
