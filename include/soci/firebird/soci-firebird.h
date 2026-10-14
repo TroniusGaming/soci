@@ -362,6 +362,7 @@ private:
 	ISC_LONG event_listen_handle_ = 0;
 	bool event_cancel_pending_ = false; // isc_cancel_events() in flight: event_handler() must not re-queue
 	bool event_fired_during_cancel_ = false; // event_handler() consumed the request while it was being cancelled
+	std::atomic<bool> event_shutdown_ = false; // set once by cleanUp(): event_handler() never re-queues again
 	std::vector<uint8_t> event_buffer_;
 	std::vector<uint8_t> event_results_;
 	std::map<std::string, size_t> triggered_events_;
@@ -372,6 +373,7 @@ private:
 	void free_event_buffers();
 
 	void listen();
+	void drop_consumed_request();
 
 	int wait_for_service_result(isc_svc_handle handle);
 
