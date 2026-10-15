@@ -12,6 +12,25 @@
 using namespace soci;
 using namespace soci::details::firebird;
 
+namespace
+{
+
+// on failure the handle is cancelled and dropped before throwing, so a retried save() starts from a fresh blob
+void close_blob(isc_blob_handle & bhp)
+{
+    ISC_STATUS stat[20];
+    if (isc_close_blob(stat, &bhp))
+    {
+        ISC_STATUS cancel_stat[20];
+        isc_cancel_blob(cancel_stat, &bhp);
+        bhp = 0;
+        throw_iscerror(stat);
+    }
+    bhp = 0;
+}
+
+} // namespace anonymous
+
 firebird_blob_backend::firebird_blob_backend(firebird_session_backend &session)
 	  : session_(session), bid_(), from_db_(false), bhp_(0), data_(),
 		loaded_(false), max_seg_size_(0)
@@ -19,7 +38,14 @@ firebird_blob_backend::firebird_blob_backend(firebird_session_backend &session)
 
 firebird_blob_backend::~firebird_blob_backend()
 {
-    cleanUp();
+    try
+    {
+        cleanUp();
+    }
+    catch (...)
+    {
+        // a destructor must not throw (building the error can throw bad_alloc too); close_blob() has already dropped the handle
+    }
 }
 
 std::size_t firebird_blob_backend::get_len()
@@ -154,21 +180,16 @@ void firebird_blob_backend::open()
 
 void firebird_blob_backend::cleanUp()
 {
+    // close first: if it throws, the buffered data is kept so save() can be retried
+    if (bhp_ != 0)
+    {
+        close_blob(bhp_);
+    }
+
     from_db_ = false;
     loaded_ = false;
     max_seg_size_ = 0;
     data_.resize(0);
-
-    if (bhp_ != 0)
-    {
-        // close blob
-        ISC_STATUS stat[20];
-        if (isc_close_blob(stat, &bhp_))
-        {
-            throw_iscerror(stat);
-        }
-        bhp_ = 0;
-    }
 }
 
 // loads blob data into internal buffer
@@ -236,11 +257,7 @@ void firebird_blob_backend::save()
     ISC_STATUS stat[20];
     if (bhp_ != 0)
     {
-        if (isc_close_blob(stat, &bhp_))
-        {
-            throw_iscerror(stat);
-        }
-        bhp_ = 0;
+        close_blob(bhp_);
     }
 
     // create new blob

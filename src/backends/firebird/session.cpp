@@ -396,28 +396,39 @@ isc_tr_handle* firebird_session_backend::current_transaction()
 
 void firebird_session_backend::cleanUp()
 {
+    // runs from the destructor, so nothing here may throw; after a lost connection every call below fails anyway
     ISC_STATUS stat[stat_size];
 
-    // at the end of session our transaction is finally commited.
     if (trhp_ != 0)
     {
         if (isc_commit_transaction(stat, &trhp_))
         {
-            throw_iscerror(stat);
+            isc_rollback_transaction(stat, &trhp_);
         }
 
         trhp_ = 0;
-		trflags_ = details::trf_none;
+        trflags_ = details::trf_none;
     }
 
-	stop_event_listener();
+    // Before the cancel: if it fails, the request stays queued until the detach below, and a callback in that
+    // window must not re-queue against the attachment being torn down. A handler that read the flag before this
+    // store re-queues while holding the mutex, so stop_event_listener() then sees and cancels the new handle.
+    event_shutdown_ = true;
 
-    if (isc_detach_database(stat, &dbhp_))
+    try
     {
-        throw_iscerror(stat);
+        stop_event_listener();
+    }
+    catch (...)
+    {
+        // the cancel failed with no callback, or locking/allocating threw: the request dies with the attachment below
     }
 
-    dbhp_ = 0L;
+    if (dbhp_ != 0)
+    {
+        isc_detach_database(stat, &dbhp_);
+        dbhp_ = 0L;
+    }
 }
 
 bool firebird_session_backend::get_next_sequence_value(
@@ -453,44 +464,33 @@ void firebird_session_backend::free_event_buffers()
 
 void firebird_session_backend::stop_event_listener()
 {
-	// Must not hold event_listener_mutex_ across isc_cancel_events(): fbclient's event thread
-	// holds its internal callback mutex while calling event_handler (which takes our mutex),
-	// and isc_cancel_events waits for that same callback mutex -> ABBA deadlock.
-	// While the cancel is pending, event_handler still records the counts but does not re-queue.
-	// Firebird event requests are one-shot, so a callback during the cancel means the request is
-	// gone and the listener is stopped whatever isc_cancel_events() returns. Otherwise the handle
-	// and buffers are kept until the cancel succeeds, so on failure start_event_listener() refuses
-	// to restart and a late callback from the still-active request sees its own buffers.
 	ISC_LONG handle;
 	{
 		std::lock_guard lock(event_listener_mutex_);
+		// another caller is already cancelling this request: a second cancel would race it on the shared flags and buffers
 		if (!event_listen_handle_ || event_cancel_pending_)
 			return;
+
 		handle = event_listen_handle_;
 		event_cancel_pending_ = true;
 		event_fired_during_cancel_ = false;
 	}
 
+	// Cancel without holding event_listener_mutex_: fbclient may be inside event_handler() for this request,
+	// holding its own callback mutex while waiting for ours, and isc_cancel_events() waits for that callback.
 	ISC_STATUS stat[stat_size];
-	const bool failed = isc_cancel_events(stat, &dbhp_, &handle);
+	const bool cancel_failed = isc_cancel_events(stat, &dbhp_, &handle) != 0;
 
-	bool request_active;
-	{
-		std::lock_guard lock(event_listener_mutex_);
-		request_active = failed && !event_fired_during_cancel_;
-		event_cancel_pending_ = false;
-		event_fired_during_cancel_ = false;
-		if (!request_active)
-		{
-			free_event_buffers();
-			event_listen_handle_ = 0;
-		}
-	}
+	std::lock_guard lock(event_listener_mutex_);
+	event_cancel_pending_ = false;
 
-	if (request_active)
-	{
+	// A callback that ran meanwhile consumed the request without re-queueing, so a failed cancel is expected then.
+	// Otherwise the request may still be queued: keep the handle and buffers it delivers into.
+	if (cancel_failed && !event_fired_during_cancel_)
 		throw_iscerror(stat);
-	}
+
+	free_event_buffers();
+	event_listen_handle_ = 0;
 }
 
 class event_iterator
@@ -554,9 +554,14 @@ void firebird_session_backend::event_handler(void* object, ISC_USHORT size, cons
 
 	firebird_session_backend* backend = (firebird_session_backend*)object;
 
-	std::lock_guard lock(backend->event_listener_mutex_);
-	if (backend->event_listen_handle_)
+	// Nothing may unwind into fbclient's thread: locking, the event name strings and the map insert can all throw.
+	std::unique_lock<std::mutex> lock(backend->event_listener_mutex_, std::defer_lock);
+	try
 	{
+		lock.lock();
+		if (!backend->event_listen_handle_)
+			return;
+
 		std::memcpy(backend->event_results_.data(), tmpbuffer, size);
 
 		event_iterator prev_state = backend->event_buffer_.data();
@@ -573,10 +578,33 @@ void firebird_session_backend::event_handler(void* object, ISC_USHORT size, cons
 			}
 		}
 
-		if (backend->event_cancel_pending_)
-			backend->event_fired_during_cancel_ = true; // request consumed; stop_event_listener() treats it as stopped
+		if (backend->event_cancel_pending_ || backend->event_shutdown_)
+			backend->drop_consumed_request();
 		else
 			backend->listen();
+	}
+	catch (...)
+	{
+		// The request fired and was not re-queued. If locking itself threw, the state can't be touched safely
+		// and the stale handle stays until stop_event_listener().
+		if (lock.owns_lock())
+			backend->drop_consumed_request();
+	}
+}
+
+// The request fired and won't be re-queued: leave the listener in the stopped state.
+void firebird_session_backend::drop_consumed_request()
+{
+	if (event_cancel_pending_)
+	{
+		// stop_event_listener() frees the buffers and the handle once its cancel returns; clearing the handle here
+		// would let start_event_listener() refill the buffers during that window
+		event_fired_during_cancel_ = true;
+	}
+	else
+	{
+		free_event_buffers();
+		event_listen_handle_ = 0;
 	}
 }
 
